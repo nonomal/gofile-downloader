@@ -1,21 +1,48 @@
 #! /usr/bin/env python3
 
 
-from os import getcwd, getenv, listdir, makedirs, path, rmdir
+from os import getcwd, getenv, listdir, makedirs, name, path, rmdir, name
 from sys import exit, stdout, stderr
 from typing import Any, Iterator, NoReturn, TextIO
 from itertools import count
 from requests import Session, Response, Timeout
 from requests.structures import CaseInsensitiveDict
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock, Event
-from platform import system
+from threading import Event
 from hashlib import sha256
 from shutil import move
 from time import perf_counter
 
 
-NEW_LINE: str = "\n" if system() != "Windows" else "\r\n"
+NEW_LINE: str = "\n" if name != "nt" else "\r\n"
+
+
+def has_ansi_support() -> bool:
+    """
+    has_ansi_support
+
+    Checks whether the platform support ansi or not.
+
+    :return: True if the platform supports it.
+    """
+
+    import os
+    import sys
+
+    if not sys.stdout.isatty():
+        return False
+
+    if os.name == "nt":
+        # Not sure, but I think the console on win10+ have default ansi support
+        return sys.getwindowsversion().major >= 10
+
+    # I hope the rest supports it??
+    return True
+
+
+# I hope these 100 character are enough for fallback,
+# anyone using win7 still?
+TERMINAL_CLEAR_LINE: str =  f"\r{" " * 100} \r" if not has_ansi_support() else "\033[2K\r"
 
 
 def _print(msg: str, error: bool = False) -> None:
@@ -64,18 +91,17 @@ class Downloader:
         self._chunk_size: int = int(getenv("GF_CHUNK_SIZE", 2097152))
 
         self._session: Session = Session()
-        self._lock: Lock = Lock()
         self._stop_event: Event = Event()
-        self._message: str = " "
         self._root_dir: str = root_dir if root_dir else getcwd()
         self._url_or_file: str = url_or_file
         self._password: str | None = password
-        self._headers: dict[str, str] = {
+
+        self._session.headers.update({
             "Accept-Encoding": "gzip",
             "User-Agent": self._user_agent if self._user_agent else "Mozilla/5.0",
             "Connection": "keep-alive",
             "Accept": "*/*",
-        }
+        })
 
         # Dictionary to hold information about file and its directories structure
         # {"index": {"path": "", "filename": "", "link": ""}}
@@ -137,7 +163,7 @@ class Downloader:
         self._build_content_tree_structure(content_dir, content_id, _password)
 
         # removes the root content directory if there's no file or subdirectory
-        if not listdir(content_dir) and not self._files_info:
+        if path.exists(content_dir) and not listdir(content_dir) and not self._files_info:
             _print(f"Empty directory for url: {url}, nothing done.{NEW_LINE}")
             self._remove_dir(content_dir)
             self._reset_class_properties()
@@ -224,8 +250,8 @@ class Downloader:
         """
 
         if token:
-            self._headers["Cookie"] = f"accountToken={token}"
-            self._headers["Authorization"] = f"Bearer {token}"
+            self._session.cookies.set("Cookie", f"accountToken={token}")
+            self._session.headers.update({"Authorization": f"Bearer {token}"})
             return
 
         response: dict[Any, Any] = {}
@@ -234,7 +260,6 @@ class Downloader:
             try:
                 response = self._session.post(
                     "https://api.gofile.io/accounts",
-                    headers=self._headers,
                     timeout=self._timeout
                 ).json()
             except Timeout:
@@ -245,8 +270,8 @@ class Downloader:
         if not response and response["status"] != "ok":
             die("Account creation failed!")
 
-        self._headers["Cookie"] = f"accountToken={response['data']['token']}"
-        self._headers["Authorization"] = f"Bearer {response['data']['token']}"
+        self._session.cookies.set("Cookie", f"accountToken={response['data']['token']}")
+        self._session.headers.update({"Authorization": f"Bearer {response['data']['token']}"})
 
 
     def _download_content(self, file_info: dict[str, str]) -> None:
@@ -267,24 +292,21 @@ class Downloader:
         tmp_file: str =  f"{filepath}.part"
         url: str = file_info["link"]
 
-        # check for partial download and resume from last byte
-        headers: dict[str, str] = self._headers.copy()
         if path.isfile(tmp_file):
             part_size = int(path.getsize(tmp_file))
-            headers["Range"] = f"bytes={part_size}-"
+            self._session.headers.update({"Range": f"bytes={part_size}-"})
 
         for _ in range(self._number_retries):
             try:
                 part_size: int = 0
                 if path.isfile(tmp_file):
                     part_size = int(path.getsize(tmp_file))
-                    headers["Range"] = f"bytes={part_size}-"
+                    self._session.headers.update({"Range": f"bytes={part_size}-"})
 
                 has_size: str | None = self._perform_download(
                     file_info,
                     url,
                     tmp_file,
-                    headers,
                     part_size
                 )
             except Timeout:
@@ -317,7 +339,6 @@ class Downloader:
         file_info: dict[str, str],
         url: str,
         tmp_file: str,
-        headers: dict[str, str],
         part_size: int,
     ) -> str | None:
         """
@@ -328,7 +349,6 @@ class Downloader:
         :param file_info: a dictionary containing file details.
         :param url: the file download URL.
         :param tmp_file: temporary file path for partial downloads.
-        :param headers: request headers.
         :param part_size: the current partial file size.
         :return: the total file size (if available).
         """
@@ -336,12 +356,11 @@ class Downloader:
         if self._stop_event.is_set():
             return
 
-        response: Response | None = self._get_response(url=url, headers=headers, stream=True)
+        response: Response | None = self._get_response(url=url, stream=True)
 
         if not response:
-            self._clear_message()
             _print(
-                f"Couldn't download the file, failed to get a response from {url}.{NEW_LINE}"
+                f"{TERMINAL_CLEAR_LINE}Couldn't download the file, failed to get a response from {url}.{NEW_LINE}"
             )
             return None
 
@@ -349,8 +368,8 @@ class Downloader:
             status_code: int = response.status_code
 
             if not self._is_valid_response(response.status_code, part_size):
-                self._clear_message()
                 _print(
+                    f"{TERMINAL_CLEAR_LINE}"
                     f"Couldn't download the file from {url}.{NEW_LINE}"
                     f"Status code: {status_code}{NEW_LINE}"
                 )
@@ -359,8 +378,8 @@ class Downloader:
             has_size: str | None = self._extract_file_size(response.headers, part_size)
 
             if not has_size:
-                self._clear_message()
                 _print(
+                    f"{TERMINAL_CLEAR_LINE}"
                     f"Couldn't find the file size from {url}.{NEW_LINE}"
                     f"Status code: {status_code}{NEW_LINE}"
                 )
@@ -492,13 +511,11 @@ class Downloader:
             rate /= (1024 ** 3)
             unit = "GB/s"
 
-        with self._lock:
-            self._clear_message()
-            self._message = (
-                f"\rDownloading {filename}: {part_size + i * len(chunk)} "
-                f"of {int(total_size)} {round(progress, 1)}% {round(rate, 1)}{unit}"
-            )
-            _print(self._message)
+        _print(
+            f"{TERMINAL_CLEAR_LINE}"
+            f"Downloading {filename}: {part_size + i * len(chunk)} "
+            f"of {int(total_size)} {round(progress, 1)}% {round(rate, 1)}{unit}"
+        )
 
 
     def _finalize_download(self, file_info: dict[str, str], tmp_file: str, has_size: str) -> None:
@@ -513,14 +530,13 @@ class Downloader:
         :return:
         """
 
-        with self._lock:
-            if path.getsize(tmp_file) == int(has_size):
-                _print(f"\r{' ' * len(self._message)}")
-                _print(
-                    f"\rDownloading {file_info['filename']}: {path.getsize(tmp_file)} "
-                    f"of {has_size} Done!{NEW_LINE}"
-                )
-                move(tmp_file, path.join(file_info["path"], file_info["filename"]))
+        if path.getsize(tmp_file) == int(has_size):
+            _print(
+                f"{TERMINAL_CLEAR_LINE}"
+                f"Downloading {file_info['filename']}: {path.getsize(tmp_file)} "
+                f"of {has_size} Done!{NEW_LINE}"
+            )
+            move(tmp_file, path.join(file_info["path"], file_info["filename"]))
 
 
     def _register_file(self, file_index: count, filepath: str, file_url: str) -> None:
@@ -621,10 +637,11 @@ class Downloader:
         if password:
             url = f"{url}&password={password}"
 
-        response: Response | None = self._get_response(url=url, headers=self._headers)
+        response: Response | None = self._get_response(url=url)
         json_response: dict[str, Any] = {} if not response else response.json()
 
         if not json_response or json_response["status"] != "ok":
+            print(self._session.headers)
             _print(f"Failed to fetch data response from the {url}.{NEW_LINE}")
             return
 
@@ -732,19 +749,7 @@ class Downloader:
         :return:
         """
 
-        self._message: str = " "
         self._files_info.clear()
-
-    def _clear_message(self) -> None:
-        """
-        _clear_message
-
-        Empties the terminal if there's something already to the current line.
-
-        :return:
-        """
-
-        _print(f"\r{' ' * len(self._message)}\r")
 
 
     def run(self) -> None:
@@ -772,11 +777,8 @@ class Downloader:
         :return:
         """
 
-        with self._lock:
-            self._clear_message()
-            self._message = f"\rStopping, please wait...{NEW_LINE}"
-            _print(self._message)
-            self._stop_event.set()
+        _print(f"{TERMINAL_CLEAR_LINE}Stopping, please wait...{NEW_LINE}")
+        self._stop_event.set()
 
 
 if __name__ == "__main__":
