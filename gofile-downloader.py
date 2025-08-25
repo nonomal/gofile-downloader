@@ -2,8 +2,9 @@
 
 
 from os import getcwd, getenv, listdir, makedirs, name, path, rmdir, name
-from sys import exit, stdout, stderr
+from sys import argv, exit, stdout, stderr
 from typing import Any, Iterator, NoReturn, TextIO
+from types import FrameType
 from itertools import count
 from requests import Session, Response, Timeout
 from requests.structures import CaseInsensitiveDict
@@ -11,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from hashlib import sha256
 from shutil import move
+from signal import signal, SIGINT, SIG_IGN
 from time import perf_counter
 
 
@@ -76,104 +78,90 @@ def die(msg: str) -> NoReturn:
 
 
 class Downloader:
-    def __init__(self, url_or_file: str, password: str | None = None) -> None:
-        root_dir: str | None = getenv("GF_DOWNLOAD_DIR")
+    def __init__(
+        self,
+        root_dir: str,
+        interactive: bool,
+        max_workers: int,
+        number_retries,
+        timeout: float,
+        chunk_size: int,
+        stop_event: Event,
+        session: Session,
+        url: str,
+        password: str | None = None,
+    ) -> None:
+        """
+        ]
+        Downloader
 
-        # Defaults to 5 concurrent downloads
-        self._max_workers: int = int(getenv("GF_MAX_CONCURRENT_DOWNLOADS", 5))
-        # Defaults to 5 retries
-        self._number_retries: int = int(getenv("GF_MAX_RETRIES", 5))
-        # Connection and read timeout, defaults to 15 seconds
-        self._timeout: float = float(getenv("GF_TIMEOUT", 15.0))
-        self._user_agent: str | None = getenv("GF_USERAGENT")
-        self._interactive: bool = getenv("GF_INTERACTIVE") == "1"
-        # The number of bytes it should read into memory
-        self._chunk_size: int = int(getenv("GF_CHUNK_SIZE", 2097152))
+        Downloader class to concurrently manage, download and write files to disk.
+        This one does the heavy lifting, the actual working of downloading.
 
-        self._session: Session = Session()
-        self._stop_event: Event = Event()
-        self._root_dir: str = root_dir if root_dir else getcwd()
-        self._url_or_file: str = url_or_file
-        self._password: str | None = password
-
-        self._session.headers.update({
-            "Accept-Encoding": "gzip",
-            "User-Agent": self._user_agent if self._user_agent else "Mozilla/5.0",
-            "Connection": "keep-alive",
-            "Accept": "*/*",
-        })
+        :root_dir: Directory where files will be saved (defaults to current directory).
+        :interactive: Whether download will be interactive or not
+                      (it's disabled by default while batch downloading from a text file)
+        :max_workers: Maximum number of concurrent workers (tasks).
+        :number_retries: The maximum number of connections retries for POST and GET requests.
+        :timeout: Maximum number of time to wait until give up on trying to establish a connection.
+        :chunk_size: Maximum chunk byte size.
+        :stop_event: An Event object to handle the request to stop the program and exit gracefully.
+        :session: Session object to handle headers, cookies and allowing reuse of resources and TCP connections.
+        :url: The content url to download.
+        :password: The content password if it's protected.
+        """
 
         # Dictionary to hold information about file and its directories structure
         # {"index": {"path": "", "filename": "", "link": ""}}
         # where the largest index is the top most file
         self._files_info: dict[str, dict[str, str]] = {}
 
+        self._max_workers: int = max_workers
+        self._number_retries: int = number_retries
+        self._timeout: float = timeout
+        self._interactive: bool = interactive
+        self._chunk_size: int = chunk_size
+        self._password: str | None = password
+        self._session: Session = session
+        self._stop_event: Event = stop_event
+        self._root_dir: str = root_dir
+        self._url: str = url
 
-    def _parse_url_or_file(self, url_or_file: str, _password: str | None = None) -> None:
+
+    def run(self) -> None:
         """
-        _parse_url_or_file
-
-        Parses a file or a url for possible links.
-
-        :param url_or_file: a filename with urls to be downloaded or a single url.
-        :param password: password to be used across all links, if not provided a per link password may be used.
-        :return:
-        """
-
-        if not (path.exists(url_or_file) and path.isfile(url_or_file)):
-            self._run(url_or_file, _password)
-            return
-
-        with open(url_or_file, "r") as f:
-            lines: list[str] = f.readlines()
-
-        for line in lines:
-            line_splitted: list[str] = line.split(" ")
-            url: str = line_splitted[0].strip()
-            password: str | None = _password if _password else line_splitted[1].strip() \
-                if len(line_splitted) > 1 else _password
-
-            self._run(url, password)
-
-
-    def _run(self, url: str, password: str | None = None) -> None:
-        """
-        _run
+        run
 
         Requests to start downloading files.
 
-        :param url: url of the content.
-        :param password: content's password.
         :return:
         """
 
         try:
-            if not url.split("/")[-2] == "d":
-                _print(f"The url probably doesn't have an id in it: {url}.{NEW_LINE}")
+            if not self._url.split("/")[-2] == "d":
+                _print(f"The url probably doesn't have an id in it: {self._url}.{NEW_LINE}")
                 return
 
-            content_id: str = url.split("/")[-1]
+            content_id: str = self._url.split("/")[-1]
         except IndexError:
-            _print(f"{url} doesn't seem a valid url.{NEW_LINE}")
+            _print(f"{self._url} doesn't seem a valid url.{NEW_LINE}")
             return
 
-        _password: str | None = sha256(password.encode()).hexdigest() if password else password
+        _password: str | None = sha256(self._password.encode()).hexdigest() if self._password else None
 
         content_dir: str = path.join(self._root_dir, content_id)
         self._build_content_tree_structure(content_dir, content_id, _password)
 
         # removes the root content directory if there's no file or subdirectory
         if path.exists(content_dir) and not listdir(content_dir) and not self._files_info:
-            _print(f"Empty directory for url: {url}, nothing done.{NEW_LINE}")
+            _print(f"Empty directory for url: {self._url}, nothing done.{NEW_LINE}")
             self._remove_dir(content_dir)
-            self._reset_class_properties()
             return
 
         if self._interactive:
             self._do_interactive(content_dir)
 
         self._threaded_downloads()
-        self._reset_class_properties()
 
 
     def _get_response(self, **kwargs: Any) -> Response | None:
@@ -239,41 +227,6 @@ class Downloader:
             pass
 
 
-    def _set_account_access_token(self, token: str | None = None) -> None:
-        """
-        _set_account_access_token
-
-        Get a new access token for the account created or use the token provided for an already existent account.
-
-        :param token: token to be used accross connections if available.
-        :return:
-        """
-
-        if token:
-            self._session.cookies.set("Cookie", f"accountToken={token}")
-            self._session.headers.update({"Authorization": f"Bearer {token}"})
-            return
-
-        response: dict[Any, Any] = {}
-
-        for _ in range(self._number_retries):
-            try:
-                response = self._session.post(
-                    "https://api.gofile.io/accounts",
-                    timeout=self._timeout
-                ).json()
-            except Timeout:
-                continue
-            else:
-                break
-
-        if not response and response["status"] != "ok":
-            die("Account creation failed!")
-
-        self._session.cookies.set("Cookie", f"accountToken={response['data']['token']}")
-        self._session.headers.update({"Authorization": f"Bearer {response['data']['token']}"})
-
-
     def _download_content(self, file_info: dict[str, str]) -> None:
         """
         _download_content
@@ -292,21 +245,23 @@ class Downloader:
         tmp_file: str =  f"{filepath}.part"
         url: str = file_info["link"]
 
+        headers: dict[str, str] = {}
         if path.isfile(tmp_file):
             part_size = int(path.getsize(tmp_file))
-            self._session.headers.update({"Range": f"bytes={part_size}-"})
+            headers = {"Range": f"bytes={part_size}-"}
 
         for _ in range(self._number_retries):
             try:
                 part_size: int = 0
                 if path.isfile(tmp_file):
                     part_size = int(path.getsize(tmp_file))
-                    self._session.headers.update({"Range": f"bytes={part_size}-"})
+                    headers = {"Range": f"bytes={part_size}-"}
 
                 has_size: str | None = self._perform_download(
                     file_info,
                     url,
                     tmp_file,
+                    headers,
                     part_size
                 )
             except Timeout:
@@ -339,6 +294,7 @@ class Downloader:
         file_info: dict[str, str],
         url: str,
         tmp_file: str,
+        headers: dict[str, str],
         part_size: int,
     ) -> str | None:
         """
@@ -349,6 +305,7 @@ class Downloader:
         :param file_info: a dictionary containing file details.
         :param url: the file download URL.
         :param tmp_file: temporary file path for partial downloads.
+        :param headers: request headers.
         :param part_size: the current partial file size.
         :return: the total file size (if available).
         """
@@ -356,7 +313,7 @@ class Downloader:
         if self._stop_event.is_set():
             return
 
-        response: Response | None = self._get_response(url=url, stream=True)
+        response: Response | None = self._get_response(url=url, headers=headers, stream=True)
 
         if not response:
             _print(
@@ -368,6 +325,7 @@ class Downloader:
             status_code: int = response.status_code
 
             if not self._is_valid_response(response.status_code, part_size):
+                _print(str(self._session.headers))
                 _print(
                     f"{TERMINAL_CLEAR_LINE}"
                     f"Couldn't download the file from {url}.{NEW_LINE}"
@@ -410,11 +368,11 @@ class Downloader:
 
         if status_code in (403, 404, 405, 500):
             return False
-        if part_size == 0 and status_code != 200:
-            return False
-        if part_size > 0 and status_code != 206:
-            return False
-        return True
+        if part_size == 0:
+            return status_code in (200, 206)
+        if part_size > 0:
+            return status_code == 206
+        return False
 
 
     @staticmethod
@@ -641,7 +599,6 @@ class Downloader:
         json_response: dict[str, Any] = {} if not response else response.json()
 
         if not json_response or json_response["status"] != "ok":
-            print(self._session.headers)
             _print(f"Failed to fetch data response from the {url}.{NEW_LINE}")
             return
 
@@ -730,7 +687,6 @@ class Downloader:
         if not input_list:
             _print(f"Nothing done.{NEW_LINE}")
             self._remove_dir(content_dir)
-            self._reset_class_properties()
             return
 
         keys_to_delete: list[str] = list(set(self._files_info.keys()) - set(input_list))
@@ -739,17 +695,104 @@ class Downloader:
             del self._files_info[key]
 
 
-    def _reset_class_properties(self) -> None:
-        """
-        _reset_class_properties
 
-        Simply put the properties of the class to be used again for another link if necessary.
-        This should be called after all jobs related to a link is done.
+class Manager:
+    def __init__(self, url_or_file: str, password: str | None = None) -> None:
+        """
+        Manager
+
+        Manager class to handle individual download tasks.
+
+        :url_or_file: This may be an existent text file or url.
+        :password: Password if the content is protected.
+        :return:
+        """
+
+        root_dir: str | None = getenv("GF_DOWNLOAD_DIR")
+
+        # Defaults to 5 concurrent downloads
+        self._max_workers: int = int(getenv("GF_MAX_CONCURRENT_DOWNLOADS", 5))
+        # Defaults to 5 retries
+        self._number_retries: int = int(getenv("GF_MAX_RETRIES", 5))
+        # Connection and read timeout, defaults to 15 seconds
+        self._timeout: float = float(getenv("GF_TIMEOUT", 15.0))
+        self._user_agent: str | None = getenv("GF_USERAGENT")
+        self._interactive: bool = getenv("GF_INTERACTIVE") == "1"
+        # The number of bytes it should read into memory
+        self._chunk_size: int = int(getenv("GF_CHUNK_SIZE", 2097152))
+
+        self._password: str | None = password
+        self._url_or_file: str = url_or_file
+
+        self._session: Session = Session()
+        self._stop_event: Event = Event()
+        self._root_dir: str = root_dir if root_dir else getcwd()
+
+        self._session.headers.update({
+            "Accept-Encoding": "gzip",
+            "User-Agent": self._user_agent if self._user_agent else "Mozilla/5.0",
+            "Connection": "keep-alive",
+            "Accept": "*/*",
+        })
+
+
+    def _parse_url_or_file(self) -> None:
+        """
+        _parse_url_or_file
+
+        Parses a file or a url for possible links.
 
         :return:
         """
 
-        self._files_info.clear()
+        if not (path.exists(self._url_or_file) and path.isfile(self._url_or_file)):
+            downloader: Downloader = Downloader(
+                self._root_dir,
+                self._interactive,
+                self._max_workers,
+                self._number_retries,
+                self._timeout,
+                self._chunk_size,
+                self._stop_event,
+                self._session,
+                self._url_or_file,
+                self._password
+            )
+
+            downloader.run()
+
+            return
+
+        with open(self._url_or_file, "r") as f:
+            lines: list[str] = f.readlines()
+
+        # I think it's better to limit this one here, the api may get angry if we starve it.
+        # We may make this a tunable in the future, but for now let it be hardcoded.
+        max_workers: int = self._max_workers if self._max_workers <= 10 else 10
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for line in lines:
+                if self._stop_event.is_set():
+                    return
+
+                line_splitted: list[str] = line.split(" ")
+                url: str = line_splitted[0].strip()
+                password: str | None = self._password if self._password else line_splitted[1].strip() \
+                    if len(line_splitted) > 1 else self._password
+                downloader: Downloader = Downloader(
+                    self._root_dir,
+                    False, # Disable interactive download when downloading a batch from text file.
+                    self._max_workers,
+                    self._number_retries,
+                    self._timeout,
+                    self._chunk_size,
+                    self._stop_event,
+                    self._session,
+                    url,
+                    password
+                )
+
+                executor.submit(downloader.run)
 
 
     def run(self) -> None:
@@ -761,16 +804,50 @@ class Downloader:
         :return:
         """
 
-        token: str | None = getenv("GF_TOKEN")
-
+        signal(SIGINT, self._handle_sigint)
         _print(f"Starting, please wait...{NEW_LINE}")
-        self._set_account_access_token(token)
-        self._parse_url_or_file(self._url_or_file, self._password)
+        self._set_account_access_token(getenv("GF_TOKEN"))
+        self._parse_url_or_file()
 
 
-    def stop(self) -> None:
+    def _set_account_access_token(self, token: str | None = None) -> None:
         """
-        stop
+        _set_account_access_token
+
+        Get a new access token for the account created or use the token provided for an already existent account.
+
+        :param token: token to be used accross connections if available.
+        :return:
+        """
+
+        if token:
+            self._session.cookies.set("Cookie", f"accountToken={token}")
+            self._session.headers.update({"Authorization": f"Bearer {token}"})
+            return
+
+        response: dict[Any, Any] = {}
+
+        for _ in range(self._number_retries):
+            try:
+                response = self._session.post(
+                    "https://api.gofile.io/accounts",
+                    timeout=self._timeout
+                ).json()
+            except Timeout:
+                continue
+            else:
+                break
+
+        if not response and response["status"] != "ok":
+            die("Account creation failed!")
+
+        self._session.cookies.set("Cookie", f"accountToken={response['data']['token']}")
+        self._session.headers.update({"Authorization": f"Bearer {response['data']['token']}"})
+
+
+    def _stop(self) -> None:
+        """
+        _stop
 
         Stops all work from continuing.
 
@@ -781,36 +858,45 @@ class Downloader:
         self._stop_event.set()
 
 
+    def _handle_sigint(self, _: int, __: FrameType | None) -> None:
+        """
+        _handle_sigint
+
+        Signal handler triggered when a SIGINT (when pressing CTRL-C) is received.
+        Issues the stop event so that the running tasks can close gracefully,
+        ignoring tasks that didn't start yet.
+
+        :param signum:  Signal number received (for this callback usually SIGINT).
+        :param frame:   FrameType object representing the current stack frame
+                        where the received signal was caught.
+        :return:
+        """
+
+        if not self._stop_event.is_set():
+            self._stop()
+            signal(SIGINT, SIG_IGN)
+
+
 if __name__ == "__main__":
-    downloader: Downloader | None = None
+    url_or_file: str | None = None
+    password: str | None = None
+    argc: int = len(argv)
 
-    try:
-        from sys import argv
+    if argc > 1:
+        url_or_file = argv[1]
 
-        url_or_file: str | None = None
-        password: str | None = None
-        argc: int = len(argv)
+        if argc > 2:
+            password = argv[2]
 
-        if argc > 1:
-            url_or_file = argv[1]
+        manager: Manager = Manager(url_or_file=url_or_file, password=password)
 
-            if argc > 2:
-                password = argv[2]
-
-            downloader = Downloader(url_or_file=url_or_file, password=password)
-
-            # Run
-            downloader.run()
-        else:
-            die(f"Usage:"
-                f"{NEW_LINE}"
-                f"python gofile-downloader.py https://gofile.io/d/contentid"
-                f"{NEW_LINE}"
-                f"python gofile-downloader.py https://gofile.io/d/contentid password"
-            )
-    except KeyboardInterrupt:
-        if downloader:
-            downloader.stop()
-
-        exit(1)
+        # Run
+        manager.run()
+    else:
+        die(f"Usage:"
+            f"{NEW_LINE}"
+            f"python gofile-downloader.py https://gofile.io/d/contentid"
+            f"{NEW_LINE}"
+            f"python gofile-downloader.py https://gofile.io/d/contentid password"
+        )
 
