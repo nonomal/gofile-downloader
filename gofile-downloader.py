@@ -198,7 +198,8 @@ class Downloader:
                 executor.submit(self._download_content, item)
 
 
-    def _create_dirs(self, dirname: str) -> None:
+    @staticmethod
+    def _create_dirs(dirname: str) -> None:
         """
         _create_dirs
 
@@ -211,7 +212,8 @@ class Downloader:
         makedirs(dirname, exist_ok = True)
 
 
-    def _remove_dir(self, dirname: str) -> None:
+    @staticmethod
+    def _remove_dir(dirname: str) -> None:
         """
         _remove_dir
 
@@ -476,7 +478,8 @@ class Downloader:
         )
 
 
-    def _finalize_download(self, file_info: dict[str, str], tmp_file: str, has_size: str) -> None:
+    @staticmethod
+    def _finalize_download(file_info: dict[str, str], tmp_file: str, has_size: str) -> None:
         """
         _finalize_download
 
@@ -519,8 +522,8 @@ class Downloader:
         }
 
 
+    @staticmethod
     def _resolve_naming_collision(
-        self,
         pathing_count: dict[str, int],
         absolute_parent_dir: str,
         child_name: str,
