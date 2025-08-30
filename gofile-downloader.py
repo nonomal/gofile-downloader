@@ -44,7 +44,7 @@ def has_ansi_support() -> bool:
 
 # I hope these 100 character are enough for fallback,
 # anyone using win7 still?
-TERMINAL_CLEAR_LINE: str =  f"\r{" " * 100} \r" if not has_ansi_support() else "\033[2K\r"
+TERMINAL_CLEAR_LINE: str = f"\r{' ' * 100} \r" if not has_ansi_support() else "\033[2K\r"
 
 
 def _print(msg: str, error: bool = False) -> None:
@@ -92,7 +92,6 @@ class Downloader:
         password: str | None = None,
     ) -> None:
         """
-        ]
         Downloader
 
         Downloader class to concurrently manage, download and write files to disk.
