@@ -589,7 +589,7 @@ class Downloader:
         :return:
         """
 
-        url: str = f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6&cache=true&sortField=createTime&sortDirection=1"
+        url: str = f"https://api.gofile.io/contents/{content_id}?cache=true&sortField=createTime&sortDirection=1"
 
         if not pathing_count:
             pathing_count = {}
@@ -597,7 +597,7 @@ class Downloader:
         if password:
             url = f"{url}&password={password}"
 
-        response: Response | None = self._get_response(url=url)
+        response: Response | None = self._get_response(url=url, headers={"X-Website-Token": "4fd6sg89d7s6"})
         json_response: dict[str, Any] = {} if not response else response.json()
 
         if not json_response or json_response["status"] != "ok":
